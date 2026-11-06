@@ -102,6 +102,16 @@ describe('vim.system', function()
     end)
   end
 
+  it('timeout excludes prior event-loop blocking #42521', function()
+    eq(
+      0,
+      exec_lua(function(prg)
+        vim.uv.sleep(300) -- Ensure stale/outdated cached loop time relative to timeout=200 below.
+        return vim.system({ prg, 'PATH' }, { timeout = 200 }):wait().code
+      end, n.testprg('printenv-test'))
+    )
+  end)
+
   it('kill processes', function()
     exec_lua(function()
       local signal --- @type integer?
@@ -123,6 +133,26 @@ describe('vim.system', function()
       assert(not proc, 'process still exists')
 
       assert(signal == 2)
+    end)
+  end)
+
+  it('SystemObj:wait() can return before process exit', function()
+    t.skip(t.is_os('win'), 'shell command is POSIX-only')
+
+    exec_lua(function()
+      local exited
+      local obj = vim.system({ 'sh', '-c', 'echo READY; sleep 1; echo LATER' }, nil, function(out)
+        exited = out
+      end)
+      local res = obj:wait(10000, function(stdout)
+        return stdout:match('READY') ~= nil
+      end)
+      assert(res.code == nil and res.stdout == 'READY\n', vim.inspect(res))
+      assert(vim.api.nvim_get_proc(obj.pid), 'process already exited')
+      assert(vim.wait(5000, function()
+        return exited ~= nil
+      end))
+      assert(exited.code == 0 and exited.stdout == 'READY\nLATER\n', vim.inspect(exited))
     end)
   end)
 

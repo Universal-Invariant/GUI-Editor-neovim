@@ -1,4 +1,6 @@
+local strbuffer = require('vim._core.stringbuffer')
 local uv = vim.uv
+local M = {}
 
 --- @class vim.SystemOpts
 --- @inlinedoc
@@ -55,8 +57,8 @@ local uv = vim.uv
 --- @field stdin? uv.uv_stream_t
 --- @field stdout? uv.uv_stream_t
 --- @field stderr? uv.uv_stream_t
---- @field stdout_data? string[]
---- @field stderr_data? string[]
+--- @field stdout_data? vim._core.stringbuffer
+--- @field stderr_data? vim._core.stringbuffer
 --- @field result? vim.SystemCompleted
 
 --- @enum vim.SystemSig
@@ -78,7 +80,7 @@ end
 --- @class vim.SystemObj
 --- @field cmd string[] Command name and args
 --- @field pid integer Process ID
---- @field private _state vim.SystemState
+--- @field package _state vim.SystemState
 local SystemObj = {}
 
 --- @param state vim.SystemState
@@ -130,16 +132,33 @@ end
 --- local obj = vim.system({'echo', 'hello'}, { text = true })
 --- local result = obj:wait(1000) -- waits up to 1000ms
 --- print(result.code, result.signal, result.stdout, result.stderr)
+---
+--- -- Monitor a long-lived process that prints "READY".
+--- local result = vim.system({ 'ssh', '-L', … }):wait(nil, function(stdout)
+---   return stdout:find('READY') ~= nil
+--- end)
 --- ```
 ---
 --- @param timeout? integer
+--- @param cond? fun(stdout: string, stderr: string): boolean Stops waiting when it returns true,
+--- without terminating the process. The `stdout` and `stderr` args have the accumulated output so
+--- far. The result has no `code` or `signal`.
 --- @return vim.SystemCompleted
-function SystemObj:wait(timeout)
+function SystemObj:wait(timeout, cond)
   local state = self._state
 
+  --- @param buf? vim._core.stringbuffer
+  local function output(buf)
+    return buf and buf:tostring() or nil
+  end
   local done = vim.wait(timeout or state.timeout or vim._maxint, function()
     return state.result ~= nil
-  end, nil, true)
+      or (cond ~= nil and cond(output(state.stdout_data) or '', output(state.stderr_data) or ''))
+  end, 200, true)
+
+  if done and not state.result then
+    return { stdout = output(state.stdout_data), stderr = output(state.stderr_data) } --[[@as vim.SystemCompleted]]
+  end
 
   if not done then
     -- Send sigkill since this cannot be caught
@@ -216,29 +235,28 @@ end
 --- @return uv.uv_stream_t? pipe
 --- @return integer? child_fd
 --- @return fun(err: string?, data: string?)? handler
---- @return string[]? data
+--- @return vim._core.stringbuffer? data
 local function setup_output(output, text)
   if output == false then
     return
   end
 
-  local bucket --- @type string[]?
+  local bucket --- @type vim._core.stringbuffer?
   local handler --- @type fun(err: string?, data: string?)
 
   if type(output) == 'function' then
     handler = output
   else
-    bucket = {}
+    local buf = strbuffer.new()
+    bucket = buf
     --- @param err string?
     --- @param data string?
     handler = function(err, data)
       if err then
         error(err)
       end
-      if text and data then
-        bucket[#bucket + 1] = data:gsub('\r\n', '\n')
-      else
-        bucket[#bucket + 1] = data
+      if data then
+        buf:put(text and (data:gsub('\r\n', '\n')) or data)
       end
     end
   end
@@ -362,6 +380,7 @@ end
 --- @return uv.uv_timer_t
 local function timer_oneshot(timeout, cb)
   local timer = assert(uv.new_timer())
+  uv.update_time() -- See time_watcher_start().
   timer:start(timeout, 0, function()
     timer:stop()
     timer:close()
@@ -408,8 +427,8 @@ local function _on_exit(state, code, signal, on_exit)
     state.result = {
       code = code,
       signal = signal,
-      stdout = stdout_data and table.concat(stdout_data) or nil,
-      stderr = stderr_data and table.concat(stderr_data) or nil,
+      stdout = stdout_data and stdout_data:tostring() or nil,
+      stderr = stderr_data and stderr_data:tostring() or nil,
     }
 
     if on_exit then
@@ -541,3 +560,5 @@ function vim.system(cmd, opts, on_exit)
   end
   return run(cmd, opts, on_exit)
 end
+
+return M
